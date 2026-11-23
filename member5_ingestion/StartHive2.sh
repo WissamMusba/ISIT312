@@ -1,0 +1,1 @@
+$HIVE_HOME/bin/hiveserver2
