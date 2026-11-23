@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large Raw Datasets
+*.csv
+raw/
+datasets/
+
+# Hadoop / Hive temporary files
+derby.log
+metastore_db/
+.hivehistory
+spark-warehouse/
+
+# OS generated files
+.DS_Store
+Thumbs.db
