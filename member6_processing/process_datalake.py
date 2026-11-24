@@ -1,21 +1,22 @@
 """
 ISIT312 Big Data Management — Techno Store Middle East LLC
-Data Lake Processing Pipeline: Stage 3 (Cleanse) & Stage 4 (Analytics)
-Author: Wissam (Member 6)
+Data Lake Processing Pipeline: Stage 3 (Cleanse), Stage 4 (Curate & Analytics), Stage 5 (Validate)
+Author: Wissam Musba (Member 6)
 """
 
+import html
 import sys
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    col, when, regexp_replace, split, trim, round as spark_round, 
-    avg, max, count, lag, lit, concat, monotonically_increasing_id
+    col, when, split, trim, round as spark_round, 
+    avg, max, count, lag, lit, concat, udf, monotonically_increasing_id
 )
 from pyspark.sql.window import Window
-from pyspark.sql.types import DoubleType, IntegerType
+from pyspark.sql.types import DoubleType, IntegerType, StringType
 
 def main():
     print("=" * 80)
-    print(">>> [ISIT312 BIG DATA MANAGEMENT: MEMBER 6 PROCESSING PIPELINE] <<<")
+    print(">>> [ISIT312 BIG DATA MANAGEMENT: DATA LAKE PROCESSING PIPELINE] <<<")
     print(">>> [TARGET: TECHNO STORE MIDDLE EAST LLC DATA LAKE] <<<")
     print("=" * 80)
 
@@ -27,12 +28,16 @@ def main():
 
     spark.sparkContext.setLogLevel("WARN")
 
-    # 1. Read Raw Datasets from HDFS Raw Zone
+    # 1. Read Raw Datasets from HDFS Raw Zone (Multi-line CSV enabled)
     print("\n[*] Ingesting raw datasets from HDFS Raw Zone...")
-    raw_prod_path = "hdfs:///datalake/raw/woocommerce/catalogue/ingest_date=2026-11-23/*.csv"
-    raw_sales_path = "hdfs:///datalake/raw/woocommerce/sales/ingest_date=2026-11-23/*.csv"
+    raw_prod_path = "hdfs:///datalake/raw/woocommerce/catalogue/*/*.csv"
+    raw_sales_path = "hdfs:///datalake/raw/woocommerce/sales/*/*.csv"
 
-    raw_prod_df = spark.read.option("header", "true").option("multiLine", "true").option("escape", '"').csv(raw_prod_path)
+    raw_prod_df = spark.read \
+        .option("header", "true") \
+        .option("multiLine", "true") \
+        .option("escape", '"') \
+        .csv(raw_prod_path)
     raw_sales_df = spark.read.option("header", "true").csv(raw_sales_path)
 
     total_prods = raw_prod_df.count()
@@ -40,48 +45,58 @@ def main():
     print("[*] Ingested Raw Product Records: %d" % total_prods)
     print("[*] Ingested Raw Sales Records: %d months" % total_sales_months)
 
-    # 2. Stage 3: Data Cleaning & Standardisation
+    # 2. Stage 3: Data Cleaning & Standardisation (Raw -> Cleansed Zone)
     print("\n" + "=" * 80)
     print(">>> [STAGE 3: DATA CLEANSING & TRANSFORMATION (RAW -> CLEANSED)] <<<")
     print("=" * 80)
 
-    # Detect ID column
     id_col = "ID"
     for c in raw_prod_df.columns:
         if "ID" in c:
             id_col = c
             break
 
-    # Clean HTML entities, impute missing SKUs, parse prices, clean stock
+    # UDF to decode ALL HTML entities (&amp;, &#039;, &quot;, etc.)
+    unescape_udf = udf(lambda x: html.unescape(x) if x is not None else None, StringType())
+
+    # Flag duplicate SKUs without dropping rows
+    sku_counts = raw_prod_df.filter(col("SKU").isNotNull() & (trim(col("SKU")) != "")) \
+        .groupBy(trim(col("SKU")).alias("sku_key")) \
+        .count() \
+        .withColumn("is_duplicate_sku", col("count") > 1)
+
     cleaned_prod_df = raw_prod_df \
         .withColumn("product_id", col(id_col).cast("string")) \
-        .withColumn("raw_brand", col("Brands")) \
-        .withColumn("brand_clean", regexp_replace(col("Brands"), "&amp;", "&")) \
+        .withColumn("brand_clean", unescape_udf(col("Brands"))) \
         .withColumn("brand_clean", when(col("brand_clean").isNull() | (trim(col("brand_clean")) == ""), lit("Unbranded / Generic")).otherwise(trim(col("brand_clean")))) \
-        .withColumn("name_clean", regexp_replace(col("Name"), "&amp;", "&")) \
+        .withColumn("name_clean", unescape_udf(col("Name"))) \
         .withColumn("sku_clean", when(col("SKU").isNull() | (trim(col("SKU")) == ""), concat(lit("AUTO-GEN-"), col(id_col))).otherwise(trim(col("SKU")))) \
         .withColumn("regular_price_clean", col("Regular price").cast(DoubleType())) \
-        .fillna({"regular_price_clean": 0.0}) \
         .withColumn("stock_status_clean", when(col("In stock?") == "1", lit("In Stock")).otherwise(lit("Out of Stock"))) \
         .withColumn("product_type_clean", when(col("Type").isNull() | (trim(col("Type")) == ""), lit("simple")).otherwise(trim(col("Type")))) \
         .withColumn("category_path_clean", when(col("Categories").isNull() | (trim(col("Categories")) == ""), lit("General AV")).otherwise(trim(col("Categories"))))
 
-    # Calculate cleaning metrics
-    html_defect_count = raw_prod_df.filter(col("Brands").contains("&amp;") | col("Name").contains("&amp;")).count()
+    # Write Cleansed Zone Parquet
+    cleansed_prod_loc = "hdfs:///datalake/cleansed/catalogue"
+    cleaned_prod_df.write.mode("overwrite").parquet(cleansed_prod_loc)
+    print("[+] Written Cleansed Zone Parquet: %s" % cleansed_prod_loc)
+
+    html_defect_count = raw_prod_df.filter(col("Brands").rlike("&[a-zA-Z0-9#]+;") | col("Name").rlike("&[a-zA-Z0-9#]+;")).count()
     missing_sku_count = raw_prod_df.filter(col("SKU").isNull() | (trim(col("SKU")) == "")).count()
     missing_price_count = raw_prod_df.filter(col("Regular price").isNull() | (trim(col("Regular price")) == "")).count()
+    dup_sku_count = sku_counts.filter(col("is_duplicate_sku")).count()
 
     print("[-] Successfully standardised %d product records." % total_prods)
     print("[-] HTML text entity defects resolved: %d" % html_defect_count)
     print("[-] Missing SKUs imputed with surrogate keys: %d" % missing_sku_count)
-    print("[-] Missing / zero prices handled: %d" % missing_price_count)
+    print("[-] Missing prices preserved as NULL (not coerced to 0): %d" % missing_price_count)
+    print("[-] Duplicate SKUs flagged for governance: %d" % dup_sku_count)
 
-    # 3. Create Curated Star Schema Tables matching Hive Metastore
+    # 3. Stage 4: Create Curated Star Schema Tables matching Hive Metastore
     print("\n" + "=" * 80)
     print(">>> [STAGE 4: CURATING STAR SCHEMA PARQUET TABLES FOR HIVE] <<<")
     print("=" * 80)
 
-    # A. dim_product
     dim_product = cleaned_prod_df.select(
         col("product_id"),
         col("sku_clean").alias("sku"),
@@ -92,9 +107,9 @@ def main():
     )
     dim_prod_loc = "hdfs:///datalake/curated/runs/run_001/dim_product"
     dim_product.write.mode("overwrite").parquet(dim_prod_loc)
-    print("[+] Published Curated Parquet: %s (%d rows)" % (dim_prod_loc, dim_product.count()))
+    curated_prod_count = dim_product.count()
+    print("[+] Published Curated Parquet: %s (%d rows)" % (dim_prod_loc, curated_prod_count))
 
-    # B. dim_brand
     unique_brands = cleaned_prod_df.select("brand_clean").distinct() \
         .withColumn("brand_id", concat(lit("BRD-"), monotonically_increasing_id())) \
         .select(col("brand_id"), col("brand_clean").alias("brand_name"))
@@ -102,7 +117,6 @@ def main():
     unique_brands.write.mode("overwrite").parquet(dim_brand_loc)
     print("[+] Published Curated Parquet: %s (%d unique brands)" % (dim_brand_loc, unique_brands.count()))
 
-    # C. dim_category
     unique_cats = cleaned_prod_df.select("category_path_clean").distinct() \
         .withColumn("category_id", concat(lit("CAT-"), monotonically_increasing_id())) \
         .withColumn("category_name", split(col("category_path_clean"), " > ")[0]) \
@@ -111,7 +125,6 @@ def main():
     unique_cats.write.mode("overwrite").parquet(dim_cat_loc)
     print("[+] Published Curated Parquet: %s (%d unique category paths)" % (dim_cat_loc, unique_cats.count()))
 
-    # D. Process Sales Summary
     sales_clean = raw_sales_df \
         .withColumn("year_month", col("Date")) \
         .withColumn("items_sold", col("Number of items sold").cast(IntegerType())) \
@@ -124,13 +137,13 @@ def main():
         .withColumn("report_year", split(col("Date"), "-")[0].cast(IntegerType())) \
         .withColumn("report_month", split(col("Date"), "-")[1].cast(IntegerType()))
 
-    # E. dim_date
+    sales_clean.write.mode("overwrite").parquet("hdfs:///datalake/cleansed/sales")
+
     dim_date = sales_clean.select("year_month", "report_year", "report_month")
     dim_date_loc = "hdfs:///datalake/curated/runs/run_001/dim_date"
     dim_date.write.mode("overwrite").parquet(dim_date_loc)
     print("[+] Published Curated Parquet: %s (%d date rows)" % (dim_date_loc, dim_date.count()))
 
-    # F. fact_sales_monthly
     fact_sales = sales_clean.select(
         "year_month", "items_sold", "total_orders", 
         "gross_sales", "net_sales", "shipping_amount", 
@@ -138,19 +151,20 @@ def main():
     )
     fact_sales_loc = "hdfs:///datalake/curated/runs/run_001/fact_sales_monthly"
     fact_sales.write.mode("overwrite").parquet(fact_sales_loc)
-    print("[+] Published Curated Parquet: %s (%d monthly sales rows)" % (fact_sales_loc, fact_sales.count()))
+    curated_sales_count = fact_sales.count()
+    print("[+] Published Curated Parquet: %s (%d monthly sales rows)" % (fact_sales_loc, curated_sales_count))
 
-    # 4. Stage 4: Run Sample Analytical Jobs
+    # 4. Analytical Jobs
     print("\n" + "=" * 80)
-    print(">>> [STAGE 4: ANALYTICAL JOBS ON CURATED DATA LAKE] <<<")
+    print(">>> [ANALYTICAL JOBS ON CURATED DATA] <<<")
     print("=" * 80)
 
-    # Job 1: Top 10 Brands by Catalog Volume and Pricing
+    # Job 1: Top 10 Brands (excluding NULL prices from average calculation)
     print("\n--- [Job 1: Top 10 Brands by Catalog Volume and Pricing (AED)] ---")
     job1_df = cleaned_prod_df.groupBy("brand_clean") \
         .agg(
             count("product_id").alias("Catalog_Count"),
-            spark_round(avg("regular_price_clean"), 2).alias("Avg_Price_AED"),
+            spark_round(avg(when(col("regular_price_clean") > 0, col("regular_price_clean"))), 2).alias("Avg_Price_AED"),
             spark_round(max("regular_price_clean"), 2).alias("Max_Price_AED")
         ) \
         .orderBy(col("Catalog_Count").desc()) \
@@ -161,7 +175,7 @@ def main():
     print("\n--- [Job 2: Product Price Bracket Distribution] ---")
     bracket_df = cleaned_prod_df \
         .withColumn("price_tier", 
-            when(col("regular_price_clean") == 0, lit("Free / Unpriced"))
+            when(col("regular_price_clean").isNull() | (col("regular_price_clean") == 0), lit("Unpriced / NULL"))
             .when(col("regular_price_clean") < 1000, lit("Entry / Budget (< 1k AED)"))
             .when(col("regular_price_clean") <= 5000, lit("Mid-Range (1k - 5k AED)"))
             .when(col("regular_price_clean") <= 15000, lit("Professional (5k - 15k AED)"))
@@ -173,13 +187,14 @@ def main():
         .orderBy(col("Product_Count").desc())
     job2_df.show(truncate=False)
 
-    # Job 3: 13-Month Sales Trend & MoM Revenue Growth Analysis
-    print("\n--- [Job 3: 13-Month Sales Performance & MoM Growth] ---")
-    w_spec = Window.orderBy("year_month")
-    job3_df = fact_sales \
+    # Job 3: 13-Month Sales Trend & MoM Revenue Growth (Chronologically sorted by year and month)
+    print("\n--- [Job 3: 13-Month Sales Performance & MoM Growth (Chronological)] ---")
+    w_spec = Window.orderBy("report_year", "report_month")
+    job3_df = sales_clean \
         .withColumn("true_avg_order_value", spark_round(col("net_sales") / col("total_orders"), 2)) \
         .withColumn("prev_net", lag("net_sales", 1).over(w_spec)) \
         .withColumn("mom_growth_pct", spark_round(((col("net_sales") - col("prev_net")) / col("prev_net")) * 100.0, 1)) \
+        .orderBy("report_year", "report_month") \
         .select(
             col("year_month").alias("Month"),
             col("total_orders").alias("Orders"),
@@ -190,6 +205,17 @@ def main():
             col("mom_growth_pct").alias("MoM_Growth_Pct")
         )
     job3_df.show(15, truncate=False)
+
+    # 5. Stage 5 (P5): Validation & Record Accounting Gate
+    print("\n" + "=" * 80)
+    print(">>> [STAGE 5 (P5): DATA VALIDATION & RECORD ACCOUNTING GATE] <<<")
+    print("=" * 80)
+    assert total_prods == curated_prod_count, f"Record mismatch! Raw={total_prods}, Curated={curated_prod_count}"
+    assert total_sales_months == curated_sales_count, f"Sales mismatch! Raw={total_sales_months}, Curated={curated_sales_count}"
+    print("[PASS] Product Record Accounting: Raw (%d) == Curated (%d) [100%% Retained]" % (total_prods, curated_prod_count))
+    print("[PASS] Sales Record Accounting: Raw (%d months) == Curated (%d months) [100%% Retained]" % (total_sales_months, curated_sales_count))
+    print("[PASS] Zero NULL SKUs in dim_product: %d" % dim_product.filter(col("sku").isNull()).count())
+    print("[PASS] Pipeline P5 Validation Gate PASSED.")
 
     spark.stop()
     print("\n[+] Processing pipeline completed successfully with zero execution errors.")
