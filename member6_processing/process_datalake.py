@@ -1,11 +1,22 @@
 """
 ISIT312 Big Data Management — Techno Store Middle East LLC
-Data Lake Processing Pipeline: Stage 3 (Cleanse), Stage 4 (Curate & Analytics), Stage 5 (Validate)
+Data Lake Processing Pipeline: P2 (Cleanse), P3 (Sales), P4 (Curate & Analytics), P5 (Validate)
 Author: Wissam Musba (Member 6)
 """
 
-import html
+import os
+import re
 import sys
+
+os.environ.setdefault("PYSPARK_PYTHON", "python3")
+
+try:
+    import html
+    unescape_fn = html.unescape
+except ImportError:
+    from HTMLParser import HTMLParser
+    unescape_fn = HTMLParser().unescape
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, when, split, trim, round as spark_round, 
@@ -13,6 +24,18 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.window import Window
 from pyspark.sql.types import DoubleType, IntegerType, StringType
+
+def sanitize_columns(df):
+    """Rename columns to Parquet-safe alphanumeric_underscore identifiers."""
+    safe_cols = []
+    seen = set()
+    for c in df.columns:
+        sc = re.sub(r'[^a-zA-Z0-9_]+', '_', c).strip('_') or 'col'
+        if sc in seen:
+            sc = sc + '_' + str(len(seen))
+        seen.add(sc)
+        safe_cols.append(sc)
+    return df.toDF(*safe_cols)
 
 def main():
     print("=" * 80)
@@ -45,9 +68,9 @@ def main():
     print("[*] Ingested Raw Product Records: %d" % total_prods)
     print("[*] Ingested Raw Sales Records: %d months" % total_sales_months)
 
-    # 2. Stage 3: Data Cleaning & Standardisation (Raw -> Cleansed Zone)
+    # 2. P2: Data Cleaning & Standardisation (Raw -> Cleansed Zone)
     print("\n" + "=" * 80)
-    print(">>> [STAGE 3: DATA CLEANSING & TRANSFORMATION (RAW -> CLEANSED)] <<<")
+    print(">>> [P2: DATA CLEANSING & TRANSFORMATION (RAW -> CLEANSED)] <<<")
     print("=" * 80)
 
     id_col = "ID"
@@ -57,7 +80,7 @@ def main():
             break
 
     # UDF to decode ALL HTML entities (&amp;, &#039;, &quot;, etc.)
-    unescape_udf = udf(lambda x: html.unescape(x) if x is not None else None, StringType())
+    unescape_udf = udf(lambda x: unescape_fn(x) if x is not None else None, StringType())
 
     # Flag duplicate SKUs without dropping rows
     sku_counts = raw_prod_df.filter(col("SKU").isNotNull() & (trim(col("SKU")) != "")) \
@@ -76,9 +99,9 @@ def main():
         .withColumn("product_type_clean", when(col("Type").isNull() | (trim(col("Type")) == ""), lit("simple")).otherwise(trim(col("Type")))) \
         .withColumn("category_path_clean", when(col("Categories").isNull() | (trim(col("Categories")) == ""), lit("General AV")).otherwise(trim(col("Categories"))))
 
-    # Write Cleansed Zone Parquet
+    # Write Cleansed Zone Parquet (with Parquet-safe column names)
     cleansed_prod_loc = "hdfs:///datalake/cleansed/catalogue"
-    cleaned_prod_df.write.mode("overwrite").parquet(cleansed_prod_loc)
+    sanitize_columns(cleaned_prod_df).write.mode("overwrite").parquet(cleansed_prod_loc)
     print("[+] Written Cleansed Zone Parquet: %s" % cleansed_prod_loc)
 
     html_defect_count = raw_prod_df.filter(col("Brands").rlike("&[a-zA-Z0-9#]+;") | col("Name").rlike("&[a-zA-Z0-9#]+;")).count()
@@ -92,9 +115,9 @@ def main():
     print("[-] Missing prices preserved as NULL (not coerced to 0): %d" % missing_price_count)
     print("[-] Duplicate SKUs flagged for governance: %d" % dup_sku_count)
 
-    # 3. Stage 4: Create Curated Star Schema Tables matching Hive Metastore
+    # 3. P4: Create Curated Star Schema Tables matching Hive Metastore
     print("\n" + "=" * 80)
-    print(">>> [STAGE 4: CURATING STAR SCHEMA PARQUET TABLES FOR HIVE] <<<")
+    print(">>> [P4: CURATING STAR SCHEMA PARQUET TABLES FOR HIVE] <<<")
     print("=" * 80)
 
     dim_product = cleaned_prod_df.select(
@@ -125,17 +148,18 @@ def main():
     unique_cats.write.mode("overwrite").parquet(dim_cat_loc)
     print("[+] Published Curated Parquet: %s (%d unique category paths)" % (dim_cat_loc, unique_cats.count()))
 
-    sales_clean = raw_sales_df \
-        .withColumn("year_month", col("Date")) \
-        .withColumn("items_sold", col("Number of items sold").cast(IntegerType())) \
-        .withColumn("total_orders", col("Number of orders").cast(IntegerType())) \
-        .withColumn("gross_sales", col("Gross sales amount").cast(DoubleType())) \
-        .withColumn("net_sales", col("Net sales amount").cast(DoubleType())) \
-        .withColumn("shipping_amount", col("Shipping amount").cast(DoubleType())) \
-        .withColumn("coupon_amount", col("Coupon amount").cast(DoubleType())) \
-        .withColumn("refund_amount", col("Refund amount").cast(DoubleType())) \
-        .withColumn("report_year", split(col("Date"), "-")[0].cast(IntegerType())) \
-        .withColumn("report_month", split(col("Date"), "-")[1].cast(IntegerType()))
+    sales_clean = raw_sales_df.select(
+        col("Date").alias("year_month"),
+        col("Number of items sold").cast(IntegerType()).alias("items_sold"),
+        col("Number of orders").cast(IntegerType()).alias("total_orders"),
+        col("Gross sales amount").cast(DoubleType()).alias("gross_sales"),
+        col("Net sales amount").cast(DoubleType()).alias("net_sales"),
+        col("Shipping amount").cast(DoubleType()).alias("shipping_amount"),
+        col("Coupon amount").cast(DoubleType()).alias("coupon_amount"),
+        col("Refund amount").cast(DoubleType()).alias("refund_amount"),
+        split(col("Date"), "-")[0].cast(IntegerType()).alias("report_year"),
+        split(col("Date"), "-")[1].cast(IntegerType()).alias("report_month")
+    )
 
     sales_clean.write.mode("overwrite").parquet("hdfs:///datalake/cleansed/sales")
 
@@ -160,7 +184,7 @@ def main():
     print("=" * 80)
 
     # Job 1: Top 10 Brands (excluding NULL prices from average calculation)
-    print("\n--- [Job 1: Top 10 Brands by Catalog Volume and Pricing (AED)] ---")
+    print("\n--- [Job 1: Top 10 Brands by Catalogue Listings and Pricing (AED)] ---")
     job1_df = cleaned_prod_df.groupBy("brand_clean") \
         .agg(
             count("product_id").alias("Catalog_Count"),
@@ -172,7 +196,7 @@ def main():
     job1_df.show(10, truncate=False)
 
     # Job 2: Price Bracket Distribution
-    print("\n--- [Job 2: Product Price Bracket Distribution] ---")
+    print("\n--- [Job 2: Product Price Bracket Distribution (5 Tiers)] ---")
     bracket_df = cleaned_prod_df \
         .withColumn("price_tier", 
             when(col("regular_price_clean").isNull() | (col("regular_price_clean") == 0), lit("Unpriced / NULL"))
@@ -206,12 +230,12 @@ def main():
         )
     job3_df.show(15, truncate=False)
 
-    # 5. Stage 5 (P5): Validation & Record Accounting Gate
+    # 5. P5: Validation & Record Accounting Gate
     print("\n" + "=" * 80)
-    print(">>> [STAGE 5 (P5): DATA VALIDATION & RECORD ACCOUNTING GATE] <<<")
+    print(">>> [P5: DATA VALIDATION & RECORD ACCOUNTING GATE] <<<")
     print("=" * 80)
-    assert total_prods == curated_prod_count, f"Record mismatch! Raw={total_prods}, Curated={curated_prod_count}"
-    assert total_sales_months == curated_sales_count, f"Sales mismatch! Raw={total_sales_months}, Curated={curated_sales_count}"
+    assert total_prods == curated_prod_count, "Record mismatch! Raw=%d, Curated=%d" % (total_prods, curated_prod_count)
+    assert total_sales_months == curated_sales_count, "Sales mismatch! Raw=%d, Curated=%d" % (total_sales_months, curated_sales_count)
     print("[PASS] Product Record Accounting: Raw (%d) == Curated (%d) [100%% Retained]" % (total_prods, curated_prod_count))
     print("[PASS] Sales Record Accounting: Raw (%d months) == Curated (%d months) [100%% Retained]" % (total_sales_months, curated_sales_count))
     print("[PASS] Zero NULL SKUs in dim_product: %d" % dim_product.filter(col("sku").isNull()).count())
